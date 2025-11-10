@@ -10,10 +10,10 @@ import sys
 from datetime import datetime
 
 # Import our modules
-from win_probability import WinProbabilityModel
-from feature_engineering import MomentumFeatureExtractor
-from train_model import MomentumModel
-from trading_simulator import TradingSimulator
+from src.win_probability_enhanced import EnhancedWinProbabilityModel
+from src.feature_engineering import MomentumFeatureExtractor
+from src.momentum_model import MomentumPredictionModel
+from src.trading_simulator import TradingSimulator
 
 class Backtester:
     def __init__(self, 

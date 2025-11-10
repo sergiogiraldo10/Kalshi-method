@@ -43,19 +43,20 @@ class MomentumFeatureExtractor:
         """
         Extract features for a single game
         """
-        features_list = []
-        
-        # Track score over time
-        score_history = []
-        event_history = []
+        # First pass: build complete score history for the game
+        full_score_history = []
         
         for idx, row in game_df.iterrows():
-            # Parse score
             if pd.isna(row['SCORE']):
                 continue
             
             try:
-                score_parts = str(row['SCORE']).split(' - ')
+                score_str = str(row['SCORE'])
+                if ' - ' in score_str:
+                    score_parts = score_str.split(' - ')
+                else:
+                    score_parts = score_str.split('-')
+                
                 if len(score_parts) != 2:
                     continue
                 away_score = int(score_parts[0])
@@ -63,7 +64,6 @@ class MomentumFeatureExtractor:
             except:
                 continue
             
-            # Parse time
             try:
                 period = int(row['PERIOD'])
                 time_parts = str(row['PCTIMESTRING']).split(':')
@@ -75,34 +75,38 @@ class MomentumFeatureExtractor:
             except:
                 continue
             
-            # Calculate time remaining in game
             if period <= 4:
                 time_remaining = (4 - period) * 720 + time_in_period
             else:
                 time_remaining = max(0, (5 - (period - 4)) * 300 + time_in_period)
             
-            # Track score and events
-            score_history.append({
+            full_score_history.append({
                 'home': home_score,
                 'away': away_score,
                 'time_remaining': time_remaining,
                 'event_num': row['EVENTNUM']
             })
+        
+        # Second pass: extract features using full history
+        features_list = []
+        event_history = []
+        
+        for current_idx in range(len(full_score_history)):
+            score_entry = full_score_history[current_idx]
             
-            event_history.append({
-                'event_type': row['EVENTMSGTYPE'],
-                'home_desc': row.get('HOMEDESCRIPTION', ''),
-                'away_desc': row.get('VISITORDESCRIPTION', ''),
-                'time_remaining': time_remaining
-            })
-            
-            # Only extract features if we have enough history (at least 10 events)
-            if len(score_history) < 10:
+            # Only extract features if we have enough history
+            if current_idx < 10:
                 continue
+            
+            # Get score history up to this point
+            score_history = full_score_history[:current_idx + 1]
+            time_remaining = score_entry['time_remaining']
+            home_score = score_entry['home']
+            away_score = score_entry['away']
             
             # Extract momentum features
             momentum_features = self._calculate_momentum_features(
-                score_history, event_history, time_remaining, period
+                score_history, event_history, time_remaining, 1  # period not used
             )
             
             if momentum_features is None:
@@ -110,18 +114,21 @@ class MomentumFeatureExtractor:
             
             # Add game identifiers
             momentum_features['game_id'] = game_id
-            momentum_features['event_num'] = row['EVENTNUM']
-            momentum_features['period'] = period
+            momentum_features['event_num'] = score_entry['event_num']
+            momentum_features['period'] = 1  # Will be corrected below
             momentum_features['time_remaining'] = time_remaining
             momentum_features['home_score'] = home_score
             momentum_features['away_score'] = away_score
             momentum_features['score_diff'] = home_score - away_score
             
-            # If including outcomes, calculate if run extends (for training)
+            # If including outcomes, calculate if run extends using FULL history
             if include_outcomes:
-                momentum_features['run_extends'] = self._check_run_extension(
-                    score_history, len(score_history) - 1
+                run_extends = self._check_run_extension(
+                    full_score_history, current_idx
                 )
+                if run_extends is None:
+                    continue  # Skip samples without enough future data
+                momentum_features['run_extends'] = run_extends
             
             features_list.append(momentum_features)
         
@@ -277,11 +284,11 @@ class MomentumFeatureExtractor:
         This is the TARGET VARIABLE for training
         
         Returns:
-            1 if run extends (micro-run becomes super-run)
-            0 if run stops
+            1 if run extends (micro-run continues with strong momentum)
+            0 if run stops or momentum shifts
         """
         if current_idx + lookforward_plays >= len(score_history):
-            return 0  # Not enough future data
+            return None  # Not enough future data - skip this sample
         
         current_score = score_history[current_idx]
         
@@ -293,12 +300,13 @@ class MomentumFeatureExtractor:
         
         # Need at least a 4-0 run to check extension
         if home_run < 4 and away_run < 4:
-            return 0
+            return None
         
         # Determine which team has momentum
         team_with_momentum = 'home' if home_run > away_run else 'away'
+        current_run_size = max(home_run, away_run)
         
-        # Look forward to see if run extends to 10+ points
+        # Look forward to see if run extends
         future_scores = score_history[current_idx:current_idx + lookforward_plays]
         
         momentum_team_points = 0
@@ -315,14 +323,19 @@ class MomentumFeatureExtractor:
                 momentum_team_points += (current['away'] - previous['away'])
                 opponent_points += (current['home'] - previous['home'])
         
-        # Check if run extended to super-run (e.g., became 10-0, 12-0, etc.)
-        total_run = (home_run if team_with_momentum == 'home' else away_run) + momentum_team_points
+        # Check if run extended with strong momentum
+        # Criteria:
+        # 1. Momentum team scores at least 4 more points
+        # 2. Momentum team outscores opponent by at least 2:1 ratio (or opponent scores <= 4)
+        # 3. Total run becomes at least 8+ points
         
-        # Super-run threshold: 10+ points with opponent scoring <= 2
-        if total_run >= 10 and opponent_points <= 2:
-            return 1
+        total_run = current_run_size + momentum_team_points
         
-        return 0
+        if momentum_team_points >= 4 and total_run >= 8:
+            if opponent_points <= 4 or momentum_team_points >= opponent_points * 1.5:
+                return 1  # Run extends
+        
+        return 0  # Run stops or weakens
     
     def save_features(self, features_df, season, output_dir='data/processed'):
         """
@@ -371,10 +384,9 @@ def extract_all_features(seasons, data_dir='data/raw', output_dir='data/processe
 if __name__ == '__main__':
     # Extract features from all training and test seasons
     seasons = [
-        '2017-18', '2018-19', '2019-20', '2020-21', '2021-22',  # Training
+        '2015-16', '2016-17', '2017-18', '2018-19', '2019-20', '2020-21', '2021-22',  # Training
         '2022-23',  # Validation
         '2023-24',  # Test
-        '2024-25',  # Additional test
     ]
     
     extract_all_features(seasons, include_outcomes=True)

@@ -48,7 +48,7 @@ class NBADataAcquisition:
             try:
                 pbp = playbyplayv2.PlayByPlayV2(game_id=game_id)
                 df = pbp.get_data_frames()[0]
-                time.sleep(0.6)  # Rate limiting - NBA API recommends 600ms between requests
+                time.sleep(0.6)  # Reduced rate limiting - faster download (was 0.6s)
                 return df
             except Exception as e:
                 if attempt < retry_count - 1:
@@ -58,6 +58,35 @@ class NBADataAcquisition:
                 else:
                     print(f"  Failed after {retry_count} attempts: {e}")
                     return None
+    
+    def _load_existing_data(self, season):
+        """Load existing partial files and return already downloaded game IDs"""
+        import glob
+        pattern = os.path.join(self.output_dir, f'pbp_{season.replace("-", "_")}_partial_*.csv')
+        partial_files = glob.glob(pattern)
+        
+        # Filter out backup files
+        partial_files = [f for f in partial_files if 'BACKUP' not in f]
+        
+        if not partial_files:
+            return [], []
+        
+        # Find the latest partial file
+        latest_file = max(partial_files, key=lambda x: int(x.split('_partial_')[1].split('.csv')[0]))
+        
+        print(f"  Found existing progress: {os.path.basename(latest_file)}")
+        
+        # Load the data
+        df = pd.read_csv(latest_file)
+        # Convert game IDs to strings to match API format (e.g., '0022001069')
+        already_downloaded_ids = [str(int(gid)).zfill(10) if len(str(int(gid))) < 10 else str(int(gid)) for gid in df['GAME_ID'].unique()]
+        
+        print(f"  Already downloaded: {len(already_downloaded_ids)} games")
+        print(f"  [NOTE] Will skip these games and only download new ones")
+        
+        # DON'T return the dataframe - we only need the game IDs for skipping
+        # Returning the df causes duplicates when resuming
+        return already_downloaded_ids, []
     
     def download_season(self, season='2023-24'):
         """
@@ -73,12 +102,26 @@ class NBADataAcquisition:
             print(f"No games found for season {season}")
             return
         
-        all_pbp_data = []
-        successful_downloads = 0
+        # Load existing progress
+        already_downloaded, all_pbp_data = self._load_existing_data(season)
+        
+        # Skip already downloaded games
+        remaining_game_ids = [gid for gid in game_ids if gid not in already_downloaded]
+        
+        if not remaining_game_ids:
+            print(f"All games already downloaded for season {season}!")
+            return
+        
+        print(f"  Remaining to download: {len(remaining_game_ids)} games\n")
+        
+        already_count = len(already_downloaded)
+        successful_downloads = already_count
         failed_downloads = 0
         
-        for i, game_id in enumerate(game_ids):
-            print(f"[{i+1}/{len(game_ids)}] Downloading game {game_id}...", end=' ')
+        for i, game_id in enumerate(remaining_game_ids):
+            current_num = already_count + i + 1
+            total_games = len(game_ids)
+            print(f"[{current_num}/{total_games}] Downloading game {game_id}...", end=' ')
             
             pbp_df = self.download_play_by_play(game_id)
             
@@ -91,33 +134,75 @@ class NBADataAcquisition:
                 failed_downloads += 1
                 print("[FAILED]")
             
-            # Save progress every 50 games
+            # Save progress every 50 games (attempts, not successes)
             if (i + 1) % 50 == 0:
-                self._save_intermediate(all_pbp_data, season, i + 1)
+                self._save_intermediate(all_pbp_data, season, successful_downloads + failed_downloads, already_count)
         
         # Final save
-        if all_pbp_data:
-            combined_df = pd.concat(all_pbp_data, ignore_index=True)
-            output_file = os.path.join(self.output_dir, f'pbp_{season.replace("-", "_")}.csv')
-            combined_df.to_csv(output_file, index=False)
+        if all_pbp_data or already_count > 0:
+            # If resuming, merge old data with new data
+            if already_count > 0:
+                import glob
+                pattern = os.path.join(self.output_dir, f'pbp_{season.replace("-", "_")}_partial_*.csv')
+                partial_files = glob.glob(pattern)
+                # Filter out backup files
+                partial_files = [f for f in partial_files if 'BACKUP' not in f]
+                if partial_files:
+                    latest_file = max(partial_files, key=lambda x: int(x.split('_partial_')[1].split('.csv')[0]))
+                    print(f"\n  Loading existing data from {os.path.basename(latest_file)}...")
+                    old_df = pd.read_csv(latest_file)
+                    all_pbp_data.insert(0, old_df)
             
-            print(f"\n{'='*60}")
-            print(f"Season {season} complete!")
-            print(f"  Successful: {successful_downloads} games")
-            print(f"  Failed: {failed_downloads} games")
-            print(f"  Total plays: {len(combined_df):,}")
-            print(f"  Saved to: {output_file}")
-            print(f"{'='*60}\n")
+            if all_pbp_data:
+                combined_df = pd.concat(all_pbp_data, ignore_index=True)
+                # Remove any duplicates (just in case)
+                combined_df = combined_df.drop_duplicates(subset=['GAME_ID', 'EVENTNUM'], keep='first')
+                
+                output_file = os.path.join(self.output_dir, f'pbp_{season.replace("-", "_")}.csv')
+                combined_df.to_csv(output_file, index=False)
+                
+                print(f"\n{'='*60}")
+                print(f"Season {season} complete!")
+                print(f"  Successful: {successful_downloads} games")
+                print(f"  Failed: {failed_downloads} games")
+                print(f"  Total plays: {len(combined_df):,}")
+                print(f"  Saved to: {output_file}")
+                print(f"{'='*60}\n")
+            else:
+                print(f"No new data downloaded for season {season}")
         else:
             print(f"No data downloaded for season {season}")
     
-    def _save_intermediate(self, data_list, season, count):
-        """Save intermediate progress"""
-        if data_list:
-            combined_df = pd.concat(data_list, ignore_index=True)
-            output_file = os.path.join(self.output_dir, f'pbp_{season.replace("-", "_")}_partial_{count}.csv')
-            combined_df.to_csv(output_file, index=False)
-            print(f"\n  [Checkpoint] Saved {count} games to {output_file}")
+    def _save_intermediate(self, new_data_list, season, total_attempts, already_count=0):
+        """Save intermediate progress - ONLY saves cumulative data including old progress"""
+        if new_data_list or already_count > 0:
+            all_parts = []
+            
+            # Load existing data if any
+            if already_count > 0:
+                import glob
+                pattern = os.path.join(self.output_dir, f'pbp_{season.replace("-", "_")}_partial_*.csv')
+                partial_files = glob.glob(pattern)
+                # Filter out backup files
+                partial_files = [f for f in partial_files if 'BACKUP' not in f]
+                if partial_files:
+                    latest_file = max(partial_files, key=lambda x: int(x.split('_partial_')[1].split('.csv')[0]))
+                    old_df = pd.read_csv(latest_file)
+                    all_parts.append(old_df)
+            
+            # Add new data
+            if new_data_list:
+                all_parts.extend(new_data_list)
+            
+            if all_parts:
+                combined_df = pd.concat(all_parts, ignore_index=True)
+                # Remove duplicates
+                combined_df = combined_df.drop_duplicates(subset=['GAME_ID', 'EVENTNUM'], keep='first')
+                
+                output_file = os.path.join(self.output_dir, f'pbp_{season.replace("-", "_")}_partial_{total_attempts}.csv')
+                combined_df.to_csv(output_file, index=False)
+                unique_games = combined_df['GAME_ID'].nunique()
+                print(f"\n  [Checkpoint] Saved {unique_games} games ({len(combined_df):,} plays) to {os.path.basename(output_file)}")
     
     def download_multiple_seasons(self, seasons):
         """
@@ -152,12 +237,10 @@ def main():
     # Initialize downloader
     downloader = NBADataAcquisition(output_dir='data/raw')
     
-    # Define seasons to download (2017-2024 + current season)
+    # Define seasons to download (2020-2025)
     # Note: NBA seasons are formatted as YYYY-YY (e.g., '2023-24' for 2023-2024 season)
+    # 2017-2020 already downloaded from Kaggle
     seasons = [
-        '2017-18',  # Training data
-        '2018-19',  # Training data
-        '2019-20',  # Training data
         '2020-21',  # Training data
         '2021-22',  # Training data
         '2022-23',  # Validation data
@@ -165,9 +248,10 @@ def main():
         '2024-25',  # Additional test data (current season)
     ]
     
-    print("This will download approximately 8 seasons of NBA play-by-play data.")
-    print("Estimated time: 3-4 hours")
-    print("Estimated data size: ~500MB")
+    print("This will download 5 seasons of NBA play-by-play data (2020-2025).")
+    print("Note: 2017-2020 already available from Kaggle data")
+    print("Estimated time: 2-3 hours")
+    print("Estimated data size: ~300MB")
     print("\nStarting in 3 seconds...")
     time.sleep(3)
     

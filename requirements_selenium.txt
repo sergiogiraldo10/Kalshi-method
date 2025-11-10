@@ -1,0 +1,17 @@
+# Selenium Requirements
+selenium==4.15.2
+webdriver-manager==4.0.1
+
+# Install with:
+# pip install -r requirements_selenium.txt
+
+# Chrome/ChromeDriver Installation:
+# Option 1: Auto-install ChromeDriver
+#   pip install webdriver-manager
+#   (Script will auto-download compatible ChromeDriver)
+
+# Option 2: Manual install
+#   Download ChromeDriver: https://chromedriver.chromium.org/
+#   Match your Chrome version
+#   Add to PATH or put in project directory
+
